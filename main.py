@@ -12,14 +12,13 @@ from models import *
 
 import torch.utils.model_zoo as model_zoo
 
-
 IMAGENET_PATH = "path_to_ImageNet"
 NIPS_PATH = "path_to_nips2017_dataset"
 CIFAR_PATH = "path_to_CIFAR10"
-ADV_MODEL_PATH = "./Adv_models/ResNet50/imagenet_l2_3_0.pt" # https://github.com/MadryLab/robustness/tree/master
-ADV_MODEL_PATH_2 = "./Adv_models/ResNet50/DVCE_R50.pt"
+ADV_MODEL_PATH = "./Adv_models/imagenet_l2_3_0.pt" # https://github.com/MadryLab/robustness/tree/master dowonload an place pt 
+ADV_MODEL_PATH_2 = "./Adv_models/DVCE_R50.pt" # https://github.com/valentyn1boreiko/DVCEs/tree/main dowload and place ep_3.pt to ./Adv_models/ rename it to DVCE_R50
 RN20_PATH = "./models/resnet20_weights.pth"
-ADV_MODEL_PATH_3 = "./Adv_models/ResNet50/ConvNext_iso_CvSt_revisiting.pt"
+ADV_MODEL_PATH_3 = "./Adv_models/ConvNext_iso_CvSt_revisiting.pt" # https://github.com/nmndeep/revisiting-at download weights and place them into ./Adv_models/
 
 if __name__ == "__main__":
 
