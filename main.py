@@ -140,7 +140,7 @@ if __name__ == "__main__":
         model.load_state_dict(state_dict)
     
     elif args.model == 'ConvNext_adv':
-        from models_ADV import convnext_iso
+        from Adv_models import convnext_iso
         model = convnext_iso.convnext_iso_cvst_revisiting()
         ckpt = torch.load(ADV_MODEL_PATH_3, map_location=device, weights_only=True) #['model']
         ckpt = {k.replace('base_model.', ''): v for k, v in ckpt.items()}
