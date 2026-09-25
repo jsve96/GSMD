@@ -31,13 +31,15 @@ if __name__ == "__main__":
                         'The test will be performed on the chunk with the index given by --chunk.'))
     parser.add_argument('--chunk', default=0, type=int, help='Chunk of the dataset the test should be performed on.')
     parser.add_argument('--batchsize', type=int, required=True)
-    parser.add_argument('--attack', choices=['GSE', 'FWnucl', 'Homotopy', 'StrAttack', 'SAPF', 'SparseRS', 'PGD0', 'GSMD','GSMD_slic','GSMD_exact'],
+    parser.add_argument('--attack', choices=['GSE', 'FWnucl', 'Homotopy', 'StrAttack', 'SAPF', 'SparseRS', 'PGD0', 'GSMD','GSMD_slic','GSMD_exact','l1_APGD'],
                         type=str, required=True, help='The attack to be tested.')
     parser.add_argument('--targeted', type=int, choices=[0, 1], required=True, help='Test targeted (1) or untargeted (0) attack.')
     parser.add_argument('--sequential', type=int, choices=[0, 1], default=0, help='Run the attack sequentially for every image '
                         'in a batch (1) or not (0). This option is used for comparing the computation times of GSE and SAPF and Homotopy '
                         'attack. GSE and SAPF are the only attacks for which this option can be 1.')
     parser.add_argument('--cuda', type=int, default=0)
+
+    parser.add_argument('--pixelattack', type=int, default=0)
     args = parser.parse_args()
 
     use_gpu = torch.cuda.is_available()
@@ -151,7 +153,7 @@ if __name__ == "__main__":
 
     # ------------------------------- attacks --------------------------------
     attacks = {'GSE': GSEAttack, 'FWnucl': FWnucl, 'Homotopy': HomotopyAttack, 'StrAttack': StrAttack,
-               'SAPF': SAPF, 'SparseRS': SparseRS, 'PGD0': PGD0, 'GSMD': GSMD, 'GSMD_slic': GSMD_slic, 'GSMD_exact': GSMD_exact_new}
+               'SAPF': SAPF, 'SparseRS': SparseRS, 'PGD0': PGD0, 'GSMD': GSMD, 'GSMD_slic': GSMD_slic, 'GSMD_exact': GSMD_exact_new, 'l1_APGD': l1_APGD}
     attack = attacks[args.attack]
 
     jsonDS = "ImageNet" if args.dataset == "ImageNet" or args.dataset == "NIPS2017" else "CIFAR10"
@@ -185,6 +187,9 @@ if __name__ == "__main__":
         seq = '_sequential'
 
     # -------------------------------- test ----------------------------------
+    if args.pixelattack !=0:
+        params['patches'] = resize[0]
+        
     resdir = f'./Outputs/{args.attack}{seq}_{jsonT}_{args.dataset}_{args.model}/'
     
     os.makedirs(resdir, exist_ok=True)
