@@ -1339,6 +1339,579 @@ class GSMD_slic(Attack):
         return out
 
 
+class l1_APGD(Attack):
+
+    def __init__(
+        self,
+        model,
+        *args,
+        img_range=(-1, 1),
+        targeted: bool = True,
+        sequential: bool = False,
+        D: float = 1.0,
+        l: float = 1.0,
+        u: float = 1.0,
+        learning_rate = 1.0,
+        rho = 0.1,
+        patches = 30,
+        **kwargs
+    ):
+        """
+        Initialize the GSMD attack.
+
+        Args:
+            model (torch.nn.Module): Target model.
+            ver (bool): Verbosity flag.
+            img_range (tuple): Allowed pixel range.
+            targeted (bool): Whether the attack is targeted.
+            sequential (bool): Run attack sequentially per sample.
+            D (float): Budget for projection constraint.
+            l (float): Lower bound for perturbation.
+            u (float): Upper bound for perturbation.
+        """
+        super().__init__(model, img_range=img_range)
+        self.sequential = sequential
+        self.D = D
+        self.l = l
+        self.u = u
+        self.targeted = targeted
+        self.eta=0.0
+        self.learning_rate = learning_rate
+        self.rho = rho
+        self.patches = patches
+
+    def __call__(self, x, y, *args, **kwargs):
+        """
+        Run the attack on a batch of images.
+
+        Depending on the `sequential` flag, the attack is applied
+        either per-sample or to the full batch at once.
+
+        Args:
+            x (torch.Tensor): Input images of shape [B, C, H, W].
+            y (torch.Tensor): Labels of shape [B].
+
+        Returns:
+            torch.Tensor: Adversarial examples of same shape as x.
+        """
+        if self.sequential:
+            result = x.clone()
+            for i, (x_, y_) in enumerate(zip(x, y)):
+                result[i] = self.perform_att(
+                    x_.unsqueeze(0),
+                    y_.unsqueeze(0),
+                    D = self.D, 
+                    l = self.l,
+                    u = self.u
+                    ).detach()
+            return result
+        else:
+            print('Not sequential')
+            return self.perform_att(x, y, D=self.D, l=self.l, u=self.u,rho=self.rho,patches=self.patches)
+
+    def perform_att(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        D: float = 5.0,
+        l: float = None,
+        u: float = None,
+        steps: int = 200,
+        patches = 15,
+        rho = 0.1,
+    ) -> torch.Tensor:
+        """
+        Perform the attack using mirror descent.
+
+        Args:
+            x (torch.Tensor): Input images [B, C, H, W].
+            y (torch.Tensor): Ground-truth labels [B].
+            D (float): Constraint budget.
+            l (float): Lower bound on perturbation.
+            u (float): Upper bound on perturbation.
+            steps (int): Number of optimization steps.
+
+        Returns:
+            torch.Tensor: Adversarial images.
+        """
+       
+        u = 1-x
+        l = -1-x
+        self.eta=0.0
+
+        self.B, self.C, self.H, self.W = x.shape
+        print(patches)
+
+        self.epsilon = torch.full((self.B,), D, device=self.device) # epsilon budget per image
+
+        D_MAX = D * 2.0
+        D_MIN = 0.01  #changed to 0.01 from 0.5
+        #rho = 0.10
+        print(rho)
+
+        self.max_groups =  int(10/22.5*patches**2) 
+        self.group_budget = self.max_groups * torch.ones(self.B, device=self.device)      # exact group sparsity
+        self.alpha = 0.5 
+
+        segmentation = self.get_grid_segmentation(n=patches)
+
+        delta = torch.zeros_like(x, requires_grad=True)
+
+        x_adv = x + delta 
+
+        delta_best = torch.zeros_like(x_adv)
+
+        clean_labels = torch.argmax(self.model(x),dim=1)
+
+
+        T_warm = int(self.alpha * steps)
+
+        for t in range(steps):
+            logits = self.model(x_adv)
+
+            target_logit = logits[torch.arange(self.B), y] #new
+            true_logit = logits[torch.arange(self.B), clean_labels] #new
+            margin = target_logit - true_logit # new
+
+            losses = F.cross_entropy(logits, y, reduction="none")
+            #self.model.zero_grad()
+            grads = torch.autograd.grad(
+                losses.sum(), delta, retain_graph=False, create_graph=False
+            )[0]
+            with torch.no_grad():
+
+                probs = F.softmax(logits, dim=1)
+                conf = probs[torch.arange(self.B), y]
+                s_b = 1.0 + (self.max_groups - 1.0) * (1 - conf)
+                self.group_budget = s_b.round().long()
+
+                ##### NEW ######
+                increase = margin < 0.0
+                decrease = margin > 0.0
+                self.epsilon[increase] *= (1 + rho)
+                self.epsilon[decrease] *= (1 - rho)
+                self.epsilon = torch.clamp(self.epsilon, min=D_MIN)
+                ###### NEW #####
+
+
+                new_delta = self._md(g=grads,x=delta,lower=l,upper=u,beta=1.0,grid=segmentation)
+                
+                if t == T_warm:
+                    self.active_groups = None 
+
+                if t >= T_warm:
+                    #new_delta = self._hard_group_threshold(new_delta, segmentation)
+                    new_delta = self._persistent_group_threshold(new_delta,segmentation)
+
+                delta.copy_(new_delta)
+            
+            x_adv = x + delta
+
+            mask_prediction = torch.argmax(self.model(x_adv), dim=1) == y
+            delta_best[mask_prediction] = new_delta[mask_prediction]
+            #print(mask_prediction)
+            #delta.requires_grad = True
+        return (x + delta_best).detach()
+
+
+    def _md(
+        self,
+        g: torch.Tensor,
+        x: torch.Tensor,
+        lower: torch.Tensor,
+        upper: torch.Tensor,
+        beta: float,
+        grid: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Mirror descent with the identity mirror map
+
+            psi(x) = 1/2 ||x||_2^2
+            grad psi(x) = x
+
+        Everything else, including the adaptive step size and projection
+        constraint, is kept the same as in the exponential version.
+        """
+
+        # ---------------------------------------------------------
+        # 1. Identity mirror map:
+        #
+        #    dual_x = grad psi(x) = x
+        # ---------------------------------------------------------
+        dual_x = x
+
+        # Same adaptive learning-rate calculation as before
+        max_g2 = torch.amax(g ** 2, dim=(1, 2, 3))
+        self.eta += max_g2[:, None, None, None]
+
+        eta_t = torch.sqrt(self.eta) / self.learning_rate
+
+        descent = g / eta_t
+
+        # ---------------------------------------------------------
+        # 2. Update in dual space.
+        #
+        # Since the mirror map is identity, dual space == primal space.
+        # ---------------------------------------------------------
+        z = dual_x - descent
+
+        z_sgn = torch.sign(z)
+        z_val = torch.abs(z)
+
+        # ---------------------------------------------------------
+        # 3. Euclidean projection
+        # ---------------------------------------------------------
+        v_list = []
+
+        for d in range(z.shape[0]):
+            v_list.append(
+                self._project(
+                    z_sgn[d],
+                    z_val[d],
+                    beta,              # retained only for API compatibility
+                    self.epsilon[d],
+                    lower[d],
+                    upper[d],
+                    grid,
+                )
+            )
+
+        return torch.stack(v_list, dim=0)
+
+
+    def _project(
+        self,
+        y_sgn_full: torch.Tensor,
+        dual_y_val_full: torch.Tensor,
+        beta: float,
+        D: float,
+        l_full: torch.Tensor,
+        u_full: torch.Tensor,
+        grid: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Projection corresponding to the identity mirror map.
+
+        Same constraint structure as the exponential version:
+            - perturbation box constraints
+            - group-wise budget D
+            - one maximum magnitude representative per group
+
+        beta is unused and kept only so that the rest of the attack
+        does not have to be changed.
+        """
+
+        # ---------------------------------------------------------
+        # 1. Maximum allowed perturbation magnitude in the
+        #    direction given by the sign.
+        #
+        # Positive perturbation: <= u
+        # Negative perturbation: <= |l|
+        # ---------------------------------------------------------
+        c_full = torch.where(
+            y_sgn_full <= 0,
+            torch.abs(l_full),
+            u_full,
+        )
+
+        c_full = torch.clamp(c_full, min=0.0)
+
+        # ---------------------------------------------------------
+        # Identity mirror map:
+        #
+        # There is no log transformation of the box constraint.
+        #
+        # exponential version:
+        #     dual_c_full = log(c / beta + 1)
+        #
+        # identity version:
+        #     dual_c_full = c
+        # ---------------------------------------------------------
+        dual_c_full = c_full
+
+        # Box-clipped candidate
+        target = torch.minimum(
+            dual_y_val_full,
+            dual_c_full,
+        )
+
+        C, H, W = target.shape
+
+        num_groups = grid.max().item() + 1
+
+        # ---------------------------------------------------------
+        # 2. Flatten spatial dimensions and use the same grid
+        #    for every channel.
+        # ---------------------------------------------------------
+        flat_target = target.reshape(-1)
+
+        full_grid = grid.expand(C, H, W).reshape(-1)
+
+        # ---------------------------------------------------------
+        # 3. Maximum candidate value in every group.
+        # ---------------------------------------------------------
+        group_winner_val = torch.zeros(
+            num_groups,
+            device=target.device,
+            dtype=target.dtype,
+        )
+
+        group_winner_val.scatter_reduce_(
+            0,
+            full_grid,
+            flat_target,
+            reduce="amax",
+            include_self=True,
+        )
+
+        M_ = (grid - grid.min().item()).view(-1)
+
+        # Locations attaining the maximum in each group
+        possible_winners = (
+            target == group_winner_val[grid]
+        )
+
+        flat_possible = possible_winners.reshape(-1)
+
+        # ---------------------------------------------------------
+        # 4. Pick one representative from every group.
+        #
+        # This intentionally follows the structure of your original
+        # exponential implementation.
+        # ---------------------------------------------------------
+        final_indices = torch.zeros(
+            num_groups,
+            dtype=torch.long,
+            device=target.device,
+        )
+
+        final_indices.scatter_(
+            0,
+            full_grid[flat_possible],
+            torch.arange(
+                C * H * W,
+                device=target.device,
+            )[flat_possible],
+        )
+
+        # Unprojected magnitude of each group representative
+        dual_y_val = dual_y_val_full.reshape(-1)[final_indices]
+
+        # Box bound of each representative
+        dual_c = dual_c_full.reshape(-1)[final_indices]
+
+        c = c_full.reshape(-1)[final_indices]
+
+        # ---------------------------------------------------------
+        # 5. First check whether simple box projection already
+        #    satisfies the group budget.
+        #
+        # Identity inverse map:
+        #
+        # exponential:
+        #     beta * exp(...) - beta
+        #
+        # identity:
+        #     min(y, c)
+        # ---------------------------------------------------------
+        phi_0 = torch.minimum(
+            dual_y_val,
+            dual_c,
+        )
+
+        D_tensor = torch.as_tensor(
+            D,
+            dtype=dual_y_val.dtype,
+            device=dual_y_val.device,
+        )
+
+        if torch.sum(phi_0) <= D_tensor:
+            v = phi_0
+
+        else:
+            # -----------------------------------------------------
+            # 6. Euclidean projection onto
+            #
+            #       sum_g v_g <= D
+            #       0 <= v_g <= c_g
+            #
+            # For the identity mirror map, the KKT solution is
+            #
+            #       v_g = clip(y_g - lambda, 0, c_g)
+            #
+            # rather than the multiplicative/exponential scaling
+            # from the old mirror map.
+            # -----------------------------------------------------
+
+            lambda_lower = torch.zeros(
+                (),
+                dtype=dual_y_val.dtype,
+                device=dual_y_val.device,
+            )
+
+            # This is sufficient to make every projected value zero.
+            lambda_upper = torch.max(dual_y_val)
+
+            # Binary search for lambda
+            for _ in range(60):
+                lam = (lambda_lower + lambda_upper) / 2.0
+
+                phi = torch.clamp(
+                    dual_y_val - lam,
+                    min=0.0,
+                )
+
+                phi = torch.minimum(
+                    phi,
+                    dual_c,
+                )
+
+                if torch.sum(phi) > D_tensor:
+                    # lambda is too small
+                    lambda_lower = lam
+                else:
+                    # lambda is large enough
+                    lambda_upper = lam
+
+            lam = lambda_upper
+
+            v = torch.clamp(
+                dual_y_val - lam,
+                min=0.0,
+            )
+
+            v = torch.minimum(
+                v,
+                c,
+            )
+
+        # ---------------------------------------------------------
+        # 7. Map the group-wise magnitude back to every pixel.
+        #
+        # Again there is NO exponential inverse here because
+        # identity mirror map == identity inverse.
+        # ---------------------------------------------------------
+
+        y_val_full = torch.minimum(
+            dual_y_val_full,
+            dual_c_full,
+        )
+
+        # One maximum allowed magnitude per spatial group
+        v = (
+            v[M_]
+            .view(self.H, self.W)
+            .expand(self.C, -1, -1)
+        )
+
+        # Pixels smaller than the group maximum remain unchanged;
+        # pixels above the group maximum are clipped.
+        v_full = torch.minimum(
+            y_val_full,
+            v,
+        )
+
+        # Restore perturbation signs
+        return v_full * y_sgn_full
+
+
+    def get_grid_segmentation(self, n):
+        """
+        Creates an (H, W) tensor where pixels are grouped into an n x n grid.
+        
+        Args:
+            H, W: Height and Width of the image.
+            n: Number of blocks along each dimension (total groups = n*n).
+        """
+        block_h = self.H // n
+        block_w = self.W // n
+        
+        y_coords, x_coords = torch.meshgrid(
+            torch.arange(self.H, device=self.device), 
+            torch.arange(self.W, device=self.device), 
+            indexing='ij'
+        )
+        
+        row_idx = torch.div(y_coords, block_h, rounding_mode='floor').clamp(max=n)
+        col_idx = torch.div(x_coords, block_w, rounding_mode='floor').clamp(max=n)
+        
+        grid_indices = row_idx * n + col_idx
+        
+        return grid_indices.long()
+
+
+    def _hard_group_threshold(self, delta, grid):
+        """
+        delta: [B, C, H, W]
+        grid:  [H, W] with group ids 0,...,G-1
+        """
+        B, C, H, W = delta.shape
+        num_groups = grid.max().item() + 1
+        device = delta.device
+
+        # Expand grid to [B, C, H, W]
+        full_grid = grid.unsqueeze(0).unsqueeze(0).expand(B, C, H, W)
+        full_grid = full_grid.reshape(B, -1)   # [B, C*H*W]
+
+        abs_delta = delta.abs().reshape(B, -1) # [B, C*H*W]
+
+        out = torch.zeros_like(delta)
+
+        for b in range(B):
+            group_scores = torch.zeros(num_groups, device=device)
+
+            group_scores.scatter_reduce_(
+                0,
+                full_grid[b],
+                abs_delta[b],
+                reduce="amax"
+            )
+
+            _, active = torch.topk(group_scores, self.max_groups)
+
+            group_mask = torch.zeros(num_groups, device=device)
+            group_mask[active] = 1.0
+
+            pixel_mask = group_mask[grid]                  # [H, W]
+            pixel_mask = pixel_mask.unsqueeze(0).expand(C, -1, -1)
+
+            out[b] = delta[b] * pixel_mask
+
+        return out
+
+    def _persistent_group_threshold(self, delta, grid):
+        B, C, H, W = delta.shape
+        num_groups = grid.max().item() + 1
+        device = delta.device
+
+        if self.active_groups is None:
+            self.active_groups = []
+
+            full_grid = grid.unsqueeze(0).expand(C, H, W).reshape(-1)
+
+            for b in range(B):
+                abs_delta = delta[b].abs().reshape(-1)
+                #full_grid = grid.unsqueeze(0).expand(C, H, W).reshape(-1)
+
+                scores = torch.zeros(num_groups, device=device)
+                scores.scatter_reduce_(0, full_grid, abs_delta, reduce="amax")
+
+                s_b = int(self.group_budget[b].item())
+                _, active = torch.topk(scores, s_b)
+
+                self.active_groups.append(active)
+
+        out = torch.zeros_like(delta)
+
+        for b in range(B):
+            group_mask = torch.zeros(num_groups, device=device)
+            group_mask[self.active_groups[b]] = 1.0
+
+            pixel_mask = group_mask[grid].unsqueeze(0).expand(C, -1, -1)
+            out[b] = delta[b] * pixel_mask
+
+        return out
+
 ##################################### GSE #####################################
 
 class GSEAttack(Attack):
