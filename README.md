@@ -1,6 +1,17 @@
 # GSMD
 This repository is built upon GSE (Group-Wise Sparse and Explainable Attack) and implements a structured adversarial attack using Group Structured Mirror Descent (GSMD).
 
+![Example](Appendix_Examples.png)
+
+# Results
+
+![Base Classifier](targeted_attacks_results.png)
+
+![Adv. Classifier](targeted_attacks_results_adv.png)
+
+
+
+
 ## Setup
 Dependencies: `numpy`, `torch`, `torchvision`, `natsort`, `pandas`, `matplotlib`, `skimage`
   
